@@ -1,0 +1,83 @@
+# ARCA 2.0 - Rozdzial 2.1 - Synteza Techniczna
+# Autor: Krzysztof Krausch PL-9261-KK-774
+# Hub-and-spoke + WebSocket RFC 6455
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from typing import Dict
+import json
+import uvicorn
+
+app = FastAPI(title="ARCA 2.0 Node")
+
+# GLOBAL_STATE - wspolna pamiec calej ARKI
+GLOBAL_STATE = {
+    "node_id": "ARCA-2.0-CENTRAL",
+    "connected_nodes": 0,
+    "messages_total": 0,
+    "status": "online"
+}
+
+class ArcaConnectionManager:
+    def __init__(self):
+        # active_connections: Dict[str, WebSocket]
+        self.active_connections: Dict[str, WebSocket] = {}
+
+    async def connect(self, node_id: str, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections[node_id] = websocket
+        GLOBAL_STATE["connected_nodes"] = len(self.active_connections)
+        print(f"[ARCA] Podlaczono: {node_id} | Razem: {len(self.active_connections)}")
+        # Powiadom wszystkich, ze ktos dolaczyl
+        await self.broadcast({
+            "type": "system",
+            "msg": f"Node {node_id} dolaczyl do ARCA",
+            "state": GLOBAL_STATE
+        })
+
+    def disconnect(self, node_id: str):
+        if node_id in self.active_connections:
+            del self.active_connections[node_id]
+        GLOBAL_STATE["connected_nodes"] = len(self.active_connections)
+        print(f"[ARCA] Odłączono: {node_id}")
+
+    async def broadcast(self, message: dict):
+        # Wyslij do wszystkich podlaczonych - hub -> spoke
+        GLOBAL_STATE["messages_total"] += 1
+        dead = []
+        for node_id, ws in self.active_connections.items():
+            try:
+                await ws.send_text(json.dumps(message))
+            except:
+                dead.append(node_id)
+        for node_id in dead:
+            self.disconnect(node_id)
+
+manager = ArcaConnectionManager()
+
+@app.get("/")
+async def root():
+    return {"arca": "2.0", "status": GLOBAL_STATE["status"], "connected": GLOBAL_STATE["connected_nodes"]}
+
+@app.websocket("/ws/{node_id}")
+async def websocket_endpoint(websocket: WebSocket, node_id: str):
+    await manager.connect(node_id, websocket)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            # Hub odbiera od spoke i rozsyla do wszystkich
+            await manager.broadcast({
+                "type": "message",
+                "from": node_id,
+                "msg": data,
+                "state": GLOBAL_STATE
+            })
+    except WebSocketDisconnect:
+        manager.disconnect(node_id)
+        await manager.broadcast({
+            "type": "system",
+            "msg": f"Node {node_id} odszedl",
+            "state": GLOBAL_STATE
+        })
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
